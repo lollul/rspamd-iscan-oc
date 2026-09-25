@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -34,6 +36,14 @@ type flags struct {
 	printVersion         bool
 	once                 bool
 	dryRun               bool
+}
+
+func durationSeconds(seconds int, fallback time.Duration) time.Duration {
+	if seconds <= 0 {
+		return fallback
+	}
+
+	return time.Duration(seconds) * time.Second
 }
 
 func mustParseFlags() *flags {
@@ -79,32 +89,12 @@ func configureLogger(loglevel slog.Level) *slog.Logger {
 
 var handledSignals = []os.Signal{syscall.SIGTERM, syscall.SIGINT}
 
-func removeSigHandler() {
-	signal.Reset(handledSignals...)
-}
-
-func installSigHandler(logger *slog.Logger, clt *iscan.Client) {
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, handledSignals...)
-
-	go func() {
-		var strSig string
-
-		sig := <-sigCh
-
-		switch ssig, ok := sig.(syscall.Signal); ok {
-		case true:
-			strSig = fmt.Sprintf("%d, %s", ssig, ssig)
-		default:
-			strSig = sig.String()
-		}
-
-		logger.Info(fmt.Sprintf("received signal (%s), terminating iscan process", strSig))
-		_ = clt.Stop()
-	}()
-}
-
-func newIMAPClient(cfg *config.Config, flags *flags, logger *slog.Logger) (iscan.IMAPClient, error) {
+func newIMAPClient(
+	ctx context.Context,
+	cfg *config.Config,
+	flags *flags,
+	logger *slog.Logger,
+) (iscan.IMAPClient, error) {
 	var clt iscan.IMAPClient
 
 	imapCfg := imapclt.Config{
@@ -123,7 +113,19 @@ func newIMAPClient(cfg *config.Config, flags *flags, logger *slog.Logger) (iscan
 		clt = imapclt.NewClient(&imapCfg)
 	}
 
-	if err := clt.Connect(); err != nil {
+	connectCtx, cancel := context.WithTimeout(
+		ctx,
+		durationSeconds(cfg.IMAPOperationTimeoutSeconds, iscan.DefaultOperationTimeout),
+	)
+	defer cancel()
+
+	var err error
+	if connector, ok := clt.(interface{ ConnectContext(context.Context) error }); ok {
+		err = connector.ConnectContext(connectCtx)
+	} else {
+		err = clt.Connect()
+	}
+	if err != nil {
 		return nil, err
 	}
 
@@ -131,6 +133,7 @@ func newIMAPClient(cfg *config.Config, flags *flags, logger *slog.Logger) (iscan
 }
 
 func newIscanClient(
+	ctx context.Context,
 	cfg *config.Config,
 	logger *slog.Logger,
 	rspamc iscan.RspamdClient,
@@ -150,51 +153,63 @@ func newIscanClient(
 		Logger:                  logger,
 		Rspamc:                  rspamc,
 		IMAPClient:              imapClt,
+		Context:                 ctx,
+		OperationTimeout:        durationSeconds(cfg.IMAPOperationTimeoutSeconds, iscan.DefaultOperationTimeout),
+		RspamdTimeout:           durationSeconds(cfg.RspamdTimeoutSeconds, iscan.DefaultRspamdTimeout),
+		IdleTimeout:             durationSeconds(cfg.IMAPIdleTimeoutSeconds, iscan.DefaultIdleTimeout),
+		ShutdownTimeout:         durationSeconds(cfg.ShutdownTimeoutSeconds, iscan.DefaultShutdownTimeout),
 	}
 
 	return iscan.NewClient(&iscanCfg)
 }
 
 func runOnceAndTerminate(
+	ctx context.Context,
 	cfg *config.Config,
 	flags *flags,
 	logger *slog.Logger,
 	rspamc iscan.RspamdClient,
 ) error {
-	imapClt, err := newIMAPClient(cfg, flags, logger)
+	imapClt, err := newIMAPClient(ctx, cfg, flags, logger)
 	if err != nil {
 		return fmt.Errorf("creating imap client failed: %w", err)
 	}
 
-	clt, err := newIscanClient(cfg, logger, rspamc, imapClt)
+	clt, err := newIscanClient(ctx, cfg, logger, rspamc, imapClt)
 	if err != nil {
+		_ = imapClt.Close()
 		return fmt.Errorf("creating iscan client failed %w", err)
 	}
+	defer func() {
+		_ = clt.Stop()
+	}()
 
 	return clt.RunOnce()
 }
 
 func monitor(
+	ctx context.Context,
 	cfg *config.Config,
 	flags *flags,
 	logger *slog.Logger,
 	rspamc iscan.RspamdClient,
 ) error {
-	imapClt, err := newIMAPClient(cfg, flags, logger)
+	imapClt, err := newIMAPClient(ctx, cfg, flags, logger)
 	if err != nil {
 		return fmt.Errorf("creating imap client failed: %w", err)
 	}
 
-	clt, err := newIscanClient(cfg, logger, rspamc, imapClt)
+	clt, err := newIscanClient(ctx, cfg, logger, rspamc, imapClt)
 	if err != nil {
+		_ = imapClt.Close()
 		return err
 	}
 
-	installSigHandler(logger, clt)
-	defer removeSigHandler()
-
 	err = clt.Monitor()
 	_ = clt.Stop()
+	if ctx.Err() != nil {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("monitoring imap mailboxes failed: %w", err)
 	}
@@ -218,6 +233,9 @@ func toSlogLevel(lvl string) (slog.Level, error) {
 }
 
 func run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), handledSignals...)
+	defer stop()
+
 	flags := mustParseFlags()
 	if flags.printVersion {
 		fmt.Printf("rspamd-iscan %s (%s)\n", version, commit)
@@ -244,18 +262,28 @@ func run() error {
 	fmt.Print(cfg.String())
 
 	// TODO: allow passing all attrs as single URL to rspamc http client
-	rspamc := rspamc.New(logger, cfg.RspamdURL, cfg.RspamdPassword)
+	rspamc := rspamc.New(
+		logger,
+		cfg.RspamdURL,
+		cfg.RspamdPassword,
+		durationSeconds(cfg.RspamdTimeoutSeconds, iscan.DefaultRspamdTimeout),
+	)
 
 	if flags.once {
 		logger.Info("running once and terminating (--once)")
-		return runOnceAndTerminate(cfg, flags, logger, rspamc)
+		err := runOnceAndTerminate(ctx, cfg, flags, logger, rspamc)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
 	}
 
 	logger.Info("monitoring IMAP mailboxes continuously, retrying on retryable errors",
 		"max_retries_same_error", maxRetriesSameError)
 
 	retryRunner := retry.Runner{
-		Fn:                  func() error { return monitor(cfg, flags, logger, rspamc) },
+		Context:             ctx,
+		Fn:                  func() error { return monitor(ctx, cfg, flags, logger, rspamc) },
 		IsRetryable:         neterr.IsRetryableError,
 		MaxRetriesSameError: maxRetriesSameError,
 		RetryIntervals: []time.Duration{
@@ -264,7 +292,8 @@ func run() error {
 			time.Minute,
 			3 * time.Minute,
 		},
-		Logger: logger,
+		Logger:   logger,
+		ErrorKey: neterr.RetryKey,
 	}
 
 	return retryRunner.Run()

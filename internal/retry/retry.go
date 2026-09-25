@@ -1,6 +1,7 @@
 package retry
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -8,38 +9,52 @@ import (
 )
 
 type Runner struct {
+	Context             context.Context
 	Fn                  func() error
 	IsRetryable         func(error) bool
 	MaxRetriesSameError int
 	RetryIntervals      []time.Duration
 	Logger              *slog.Logger
+	ErrorKey            func(error) string
 
-	lastError error
-	failures  int
+	lastErrorKey string
+	failures     int
 }
 
 func (r *Runner) Run() error {
+	ctx := r.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+
 		err := r.Fn()
 		if err == nil {
 			return nil
 		}
-
-		r.failures++
+		if ctx.Err() != nil {
+			return nil
+		}
 
 		if !r.IsRetryable(err) {
 			return fmt.Errorf("non-retryable error: %w", err)
 		}
 
-		if errors.Is(err, r.lastError) {
-			if r.failures >= r.MaxRetriesSameError {
-				return fmt.Errorf("max. number of retries (%d) exceeded: %w", r.failures, err)
-			}
+		errorKey := r.errorKey(err)
+		if errorKey == r.lastErrorKey {
+			r.failures++
 		} else {
+			r.lastErrorKey = errorKey
 			r.failures = 1
 		}
 
-		r.lastError = errors.Unwrap(err)
+		if r.failures >= r.MaxRetriesSameError {
+			return fmt.Errorf("max. number of retries (%d) exceeded: %w", r.failures, err)
+		}
 
 		sleepTime := r.sleepTime()
 
@@ -51,7 +66,27 @@ func (r *Runner) Run() error {
 			"pause", sleepTime,
 		)
 
-		time.Sleep(sleepTime)
+		timer := time.NewTimer(sleepTime)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
+}
+
+func (r *Runner) errorKey(err error) string {
+	if r.ErrorKey != nil {
+		return r.ErrorKey(err)
+	}
+
+	for {
+		unwrapped := errors.Unwrap(err)
+		if unwrapped == nil {
+			return fmt.Sprintf("%T:%v", err, err)
+		}
+		err = unwrapped
 	}
 }
 

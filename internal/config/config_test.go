@@ -66,6 +66,28 @@ func TestLoadCredentialsFromDirectory_PreservesSpaces(t *testing.T) {
 	assert.Equal(t, " spaces \r\nnewline", cfg.ImapPassword)
 }
 
+func TestTimeoutDefaultsAreAppliedAfterUnmarshal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.toml")
+	assert.NoError(t, os.WriteFile(path, []byte("RspamdTimeoutSeconds = 0\nIMAPOperationTimeoutSeconds = -1\n"), 0o600))
+
+	cfg, err := FromFile(path)
+	assert.NoError(t, err)
+	assert.Equal(t, 120, cfg.RspamdTimeoutSeconds)
+	assert.Equal(t, 300, cfg.IMAPOperationTimeoutSeconds)
+}
+
+func TestTimeoutValuesAreRead(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.toml")
+	assert.NoError(t, os.WriteFile(path, []byte("RspamdTimeoutSeconds = 42\nIMAPIdleTimeoutSeconds = 84\n"), 0o600))
+
+	cfg, err := FromFile(path)
+	assert.NoError(t, err)
+	assert.Equal(t, 42, cfg.RspamdTimeoutSeconds)
+	assert.Equal(t, 84, cfg.IMAPIdleTimeoutSeconds)
+}
+
 func TestDefaults(t *testing.T) {
 	dir := t.TempDir()
 
@@ -78,4 +100,8 @@ func TestDefaults(t *testing.T) {
 	assert.Equal(t, cfg.TempDir, os.TempDir())
 	assert.Equal(t, cfg.MarkLearnedAsSpamAsRead, true)
 	assert.Equal(t, cfg.LogLevel, "info")
+	assert.Equal(t, cfg.RspamdTimeoutSeconds, 120)
+	assert.Equal(t, cfg.IMAPOperationTimeoutSeconds, 300)
+	assert.Equal(t, cfg.IMAPIdleTimeoutSeconds, 600)
+	assert.Equal(t, cfg.ShutdownTimeoutSeconds, 10)
 }

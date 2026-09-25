@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -27,14 +28,38 @@ type Config struct {
 	LogIMAPData             bool
 	MarkLearnedAsSpamAsRead bool
 	LogLevel                string
+
+	RspamdTimeoutSeconds        int
+	IMAPOperationTimeoutSeconds int
+	IMAPIdleTimeoutSeconds      int
+	ShutdownTimeoutSeconds      int
 }
 
 // New returns an new config initialized with default values
 func New() *Config {
 	return &Config{
-		LogLevel:                "info",
-		MarkLearnedAsSpamAsRead: true,
-		TempDir:                 os.TempDir(),
+		LogLevel:                    "info",
+		MarkLearnedAsSpamAsRead:     true,
+		TempDir:                     os.TempDir(),
+		RspamdTimeoutSeconds:        120,
+		IMAPOperationTimeoutSeconds: 300,
+		IMAPIdleTimeoutSeconds:      600,
+		ShutdownTimeoutSeconds:      10,
+	}
+}
+
+func (c *Config) normalizeTimeouts() {
+	if c.RspamdTimeoutSeconds <= 0 {
+		c.RspamdTimeoutSeconds = 120
+	}
+	if c.IMAPOperationTimeoutSeconds <= 0 {
+		c.IMAPOperationTimeoutSeconds = 300
+	}
+	if c.IMAPIdleTimeoutSeconds <= 0 {
+		c.IMAPIdleTimeoutSeconds = 600
+	}
+	if c.ShutdownTimeoutSeconds <= 0 {
+		c.ShutdownTimeoutSeconds = 10
 	}
 }
 
@@ -77,6 +102,10 @@ func (c *Config) String() string {
 	printKv("Keep Temporary Files", c.KeepTempFiles)
 	printKv("Log IMAP Data", c.LogIMAPData)
 	printKv("Log Level", c.LogLevel)
+	printKv("Rspamd Timeout", time.Duration(c.RspamdTimeoutSeconds)*time.Second)
+	printKv("IMAP Operation Timeout", time.Duration(c.IMAPOperationTimeoutSeconds)*time.Second)
+	printKv("IMAP Idle Timeout", time.Duration(c.IMAPIdleTimeoutSeconds)*time.Second)
+	printKv("Shutdown Timeout", time.Duration(c.ShutdownTimeoutSeconds)*time.Second)
 
 	sb.WriteRune('\n')
 	fmt.Fprintf(&sb, "Mails in %q are scanned and backuped to %q.\n", c.ScanMailbox, c.BackupMailbox)
@@ -101,6 +130,7 @@ func FromFile(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	result.normalizeTimeouts()
 
 	return result, nil
 }

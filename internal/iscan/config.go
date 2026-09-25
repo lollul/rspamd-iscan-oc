@@ -1,6 +1,7 @@
 package iscan
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"iter"
@@ -9,6 +10,17 @@ import (
 	"time"
 
 	"github.com/fho/rspamd-iscan/internal/imapclt"
+)
+
+const (
+	// DefaultOperationTimeout bounds a mailbox processing phase.
+	DefaultOperationTimeout = 5 * time.Minute
+	// DefaultRspamdTimeout bounds one Rspamd request.
+	DefaultRspamdTimeout = 2 * time.Minute
+	// DefaultIdleTimeout bounds one quiet IMAP IDLE cycle.
+	DefaultIdleTimeout = 10 * time.Minute
+	// DefaultShutdownTimeout bounds graceful transport shutdown.
+	DefaultShutdownTimeout = 10 * time.Second
 )
 
 type IMAPClient interface {
@@ -39,6 +51,12 @@ type Config struct {
 	Logger     *slog.Logger
 	IMAPClient IMAPClient
 	Rspamc     RspamdClient
+	Context    context.Context
+
+	OperationTimeout time.Duration
+	RspamdTimeout    time.Duration
+	IdleTimeout      time.Duration
+	ShutdownTimeout  time.Duration
 }
 
 func (c *Config) validate() error {
@@ -79,6 +97,10 @@ func (c *Config) validate() error {
 
 	if !fd.IsDir() {
 		return fmt.Errorf("specified TempDir (%s) is not a directory", c.TempDir)
+	}
+
+	if c.IMAPClient == nil {
+		return errors.New("IMAP client can not be nil")
 	}
 
 	if c.Rspamc == nil {

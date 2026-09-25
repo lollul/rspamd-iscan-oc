@@ -1,7 +1,10 @@
 package retry
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"io"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -168,6 +171,82 @@ func TestRun_PauseTimes(t *testing.T) {
 			assert.Equal(t, exp, sleepTimes[i])
 		}
 	})
+}
+
+func TestRun_FreshWrappersReachLimit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		r := &Runner{
+			Fn: func() error {
+				calls++
+				return fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", io.ErrUnexpectedEOF))
+			},
+			IsRetryable:         func(error) bool { return true },
+			MaxRetriesSameError: 3,
+			RetryIntervals:      []time.Duration{time.Second},
+			Logger:              log.SlogTestLogger(t),
+		}
+
+		err := r.Run()
+		assert.Error(t, err)
+		assert.Equal(t, 3, calls)
+	})
+}
+
+func TestRun_ContextStopsDuringBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	entered := make(chan struct{}, 1)
+	result := make(chan error, 1)
+	r := &Runner{
+		Context: ctx,
+		Fn: func() error {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			return errors.New("retryable")
+		},
+		IsRetryable:         func(error) bool { return true },
+		MaxRetriesSameError: 3,
+		RetryIntervals:      []time.Duration{time.Hour},
+		Logger:              log.SlogTestLogger(t),
+	}
+
+	go func() { result <- r.Run() }()
+	<-entered
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("expected clean cancellation, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry did not stop during backoff")
+	}
+}
+
+func TestRun_ContextStopsRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	r := &Runner{
+		Context: ctx,
+		Fn: func() error {
+			calls++
+			cancel()
+			return errors.New("retryable")
+		},
+		IsRetryable:         func(error) bool { return true },
+		MaxRetriesSameError: 3,
+		RetryIntervals:      []time.Duration{time.Hour},
+		Logger:              log.SlogTestLogger(t),
+	}
+
+	if err := r.Run(); err != nil {
+		t.Fatalf("expected clean cancellation, got %v", err)
+	}
+	assert.Equal(t, 1, calls)
 }
 
 type retryableError struct {

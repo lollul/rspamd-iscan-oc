@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"slices"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	"github.com/fho/rspamd-iscan/internal/imapclt"
 	"github.com/fho/rspamd-iscan/internal/log"
 	"github.com/fho/rspamd-iscan/internal/mail"
+	"github.com/fho/rspamd-iscan/internal/neterr"
 	"github.com/fho/rspamd-iscan/internal/rspamc"
 )
 
@@ -36,9 +38,15 @@ type Client struct {
 	rspamc RspamdClient
 	logger *slog.Logger
 
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	wgRun    sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	stopOnce           sync.Once
+	runMu              sync.Mutex
+	wgRun              sync.WaitGroup
+	transportCloseOnce sync.Once
+	transportCloseDone chan struct{}
+	transportCloseErr  error
 
 	scanMailbox       string
 	inboxMailbox      string
@@ -54,6 +62,11 @@ type Client struct {
 	markLearnedAsSpamAsRead bool
 
 	learnInterval time.Duration
+
+	operationTimeout time.Duration
+	rspamdTimeout    time.Duration
+	idleTimeout      time.Duration
+	shutdownTimeout  time.Duration
 
 	// cntProcessedMails counts the number of emails that have been processed
 	// in the [Client.scanMailbox], [Client.hamMailbox] and [Client.
@@ -76,6 +89,29 @@ func NewClient(cfg *Config) (*Client, error) {
 		return nil, err
 	}
 
+	parent := cfg.Context
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+
+	operationTimeout := cfg.OperationTimeout
+	if operationTimeout <= 0 {
+		operationTimeout = DefaultOperationTimeout
+	}
+	rspamdTimeout := cfg.RspamdTimeout
+	if rspamdTimeout <= 0 {
+		rspamdTimeout = DefaultRspamdTimeout
+	}
+	idleTimeout := cfg.IdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = DefaultIdleTimeout
+	}
+	shutdownTimeout := cfg.ShutdownTimeout
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = DefaultShutdownTimeout
+	}
+
 	c := &Client{
 		clt:                     cfg.IMAPClient,
 		logger:                  log.EnsureLoggerInstance(cfg.Logger),
@@ -91,29 +127,43 @@ func NewClient(cfg *Config) (*Client, error) {
 		tempDir:                 cfg.TempDir,
 		keepTempFiles:           cfg.KeepTempFiles,
 		markLearnedAsSpamAsRead: cfg.MarkLearnedAsSpamAsRead,
-		stopCh:                  make(chan struct{}),
+		operationTimeout:        operationTimeout,
+		rspamdTimeout:           rspamdTimeout,
+		idleTimeout:             idleTimeout,
+		shutdownTimeout:         shutdownTimeout,
+		transportCloseDone:      make(chan struct{}),
+		ctx:                     ctx,
+		cancel:                  cancel,
 	}
 
 	return c, nil
 }
 
 func (c *Client) ProcessHam() error {
+	return c.runIMAPPhase(c.ctx, c.processHam)
+}
+
+func (c *Client) processHam(ctx context.Context) error {
 	if c.hamMailbox == "" {
 		return nil
 	}
 
-	return c.learn(c.hamMailbox, c.inboxMailbox, false, c.rspamc.Ham)
+	return c.learn(ctx, c.hamMailbox, c.inboxMailbox, false, c.rspamc.Ham)
 }
 
 func (c *Client) ProcessSpam() error {
+	return c.runIMAPPhase(c.ctx, c.processSpam)
+}
+
+func (c *Client) processSpam(ctx context.Context) error {
 	if c.undetectedMailbox == "" {
 		return nil
 	}
 
-	return c.learn(c.undetectedMailbox, c.spamMailbox, c.markLearnedAsSpamAsRead, c.rspamc.Spam)
+	return c.learn(ctx, c.undetectedMailbox, c.spamMailbox, c.markLearnedAsSpamAsRead, c.rspamc.Spam)
 }
 
-func (c *Client) learn(srcMailbox, destMailbox string, markAsSeen bool, learnFn learnFn) error {
+func (c *Client) learn(ctx context.Context, srcMailbox, destMailbox string, markAsSeen bool, learnFn learnFn) error {
 	var processedMsgUIDs []uint32
 
 	logger := c.logger.With("mailbox.source", srcMailbox)
@@ -121,6 +171,10 @@ func (c *Client) learn(srcMailbox, destMailbox string, markAsSeen bool, learnFn 
 	logger.Info("checking mailbox for new messages to learn")
 
 	for msg, err := range c.clt.Messages(srcMailbox) {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+
 		if err != nil {
 			if errMalformed, ok := errors.AsType[*imapclt.ErrMalformedMsg](err); ok {
 				logger.Warn(
@@ -140,18 +194,26 @@ func (c *Client) learn(srcMailbox, destMailbox string, markAsSeen bool, learnFn 
 		logger.Debug("fetched message")
 
 		// TODO: retry Check if it failed with a temporary error
-		err = learnFn(
-			context.TODO(),
-			msg.Message,
-		)
+		learnCtx, cancel := context.WithTimeout(ctx, c.rspamdTimeout)
+		err = learnFn(learnCtx, msg.Message)
+		cancel()
 		if err != nil {
 			logger.Warn("learning message failed", "error", err,
 				"event", "rspamd.msg_learn_failed")
+			if errors.Is(err, context.Canceled) ||
+				errors.Is(err, context.DeadlineExceeded) ||
+				neterr.IsRetryableError(err) {
+				return err
+			}
 			return nil
 		}
 
 		logger.Info("learned message", "event", "rspamd.msg_learned")
 		processedMsgUIDs = append(processedMsgUIDs, msg.UID)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	if len(processedMsgUIDs) == 0 {
@@ -236,15 +298,40 @@ func (c *Client) isSpam(r *rspamc.CheckResult) bool {
 	return r.Score >= c.spamTreshold
 }
 
+func (c *Client) removeTempMail(mail *scannedMail) {
+	if c.keepTempFiles || mail == nil {
+		return
+	}
+
+	if err := os.Remove(mail.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		c.logger.Warn("deleting temporary email failed",
+			"error", err,
+			"filepath", mail.Path,
+			"event", "file.deletion_failed",
+		)
+	}
+}
+
+func (c *Client) cleanupScannedMails(mails []*scannedMail) {
+	for _, mail := range mails {
+		c.removeTempMail(mail)
+	}
+}
+
 // replaceWithModifiedMails uploads mails to the spam or inbox mailbox, depending on their
 // spam score.
 // The original email is moved to the backup mailbox.
 // It returns an UIDSet of all successfully uploaded mails.
 // When errors happen, an error **and** a non-empty UIDSet can be returned.
-func (c *Client) replaceWithModifiedMails(mails []*scannedMail) error {
+func (c *Client) replaceWithModifiedMails(ctx context.Context, mails []*scannedMail) error {
 	var errs []error
 
-	for _, mail := range mails {
+	for i, mail := range mails {
+		if err := ctx.Err(); err != nil {
+			c.cleanupScannedMails(mails[i:])
+			return err
+		}
+
 		var mbox string
 
 		logger := c.logger.With(
@@ -257,6 +344,7 @@ func (c *Client) replaceWithModifiedMails(mails []*scannedMail) error {
 		// must happen after appendMail!
 		err := c.clt.Move([]uint32{mail.UID}, c.backupMailbox)
 		if err != nil {
+			c.removeTempMail(mail)
 			errs = append(errs, fmt.Errorf(
 				"moving mail (%d) (%s) to backup mailbox %s failed: %w",
 				mail.UID, mail.Envelope.Subject, c.backupMailbox, err,
@@ -273,6 +361,7 @@ func (c *Client) replaceWithModifiedMails(mails []*scannedMail) error {
 
 		err = c.clt.Upload(mail.Path, mbox, mail.Envelope.Date)
 		if err != nil {
+			c.removeTempMail(mail)
 			errs = append(errs, fmt.Errorf(
 				"uploading email %d (%s) (%s) to %s failed: %w",
 				mail.UID, mail.Envelope.Subject, mail.Path, mbox, err,
@@ -288,18 +377,7 @@ func (c *Client) replaceWithModifiedMails(mails []*scannedMail) error {
 			continue
 		}
 
-		if c.keepTempFiles {
-			continue
-		}
-
-		if err := os.Remove(mail.Path); err != nil {
-			logger.Warn(
-				"deleting email file failed",
-				"error", err,
-				"event", "imap.msg_delete_failed",
-				"filepath", mail.Path,
-			)
-		}
+		c.removeTempMail(mail)
 
 		logger.Info("moved message to backup mailbox and uploaded modified message with scan results to inbox")
 	}
@@ -307,7 +385,7 @@ func (c *Client) replaceWithModifiedMails(mails []*scannedMail) error {
 	return errors.Join(errs...)
 }
 
-func (c *Client) downloadAndScan(msg *imapclt.Message) (*scannedMail, error) {
+func (c *Client) downloadAndScan(ctx context.Context, msg *imapclt.Message) (*scannedMail, error) {
 	tmpFile, err := os.CreateTemp(
 		c.tempDir,
 		"rspamd-iscan-mail-"+strconv.Itoa(int(msg.UID)),
@@ -323,11 +401,16 @@ func (c *Client) downloadAndScan(msg *imapclt.Message) (*scannedMail, error) {
 			return
 		}
 
-		if err := os.Remove(tmpFile.Name()); err != nil {
+		if err := os.Remove(tmpFile.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
 			c.logger.Error("deleting temporary file failed",
 				"error", err, "filepath", tmpFile.Name(),
 				"event", "file.deletion_failed")
 		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		errCleanupfn()
+		return nil, err
 	}
 
 	_, err = io.Copy(tmpFile, msg.Message)
@@ -352,7 +435,9 @@ func (c *Client) downloadAndScan(msg *imapclt.Message) (*scannedMail, error) {
 		return nil, fmt.Errorf("setting %q file position to beginning failed: %w", tmpFile.Name(), err)
 	}
 	// TODO: retry Check if it failed with a temporary error
-	scanResult, err := c.rspamc.Check(context.Background(), tmpFile)
+	checkCtx, cancel := context.WithTimeout(ctx, c.rspamdTimeout)
+	scanResult, err := c.rspamc.Check(checkCtx, tmpFile)
+	cancel()
 	if err != nil {
 		errCleanupfn()
 		return nil, err
@@ -363,12 +448,18 @@ func (c *Client) downloadAndScan(msg *imapclt.Message) (*scannedMail, error) {
 		return nil, fmt.Errorf("closing file of downloaded mail failed: %w", err)
 	}
 
+	if err := ctx.Err(); err != nil {
+		errCleanupfn()
+		return nil, err
+	}
+
 	if scanResult.Subject != "" && scanResult.Subject != env.Subject {
 		err := mail.ReplaceHeader(
 			tmpFile.Name(),
 			mail.Header{Name: "Subject", Body: scanResult.Subject},
 		)
 		if err != nil {
+			errCleanupfn()
 			return nil, fmt.Errorf("rewriting subject failed: %w", err)
 		}
 
@@ -381,6 +472,7 @@ func (c *Client) downloadAndScan(msg *imapclt.Message) (*scannedMail, error) {
 
 	err = addScanResultHeaders(tmpFile.Name(), scanResult)
 	if err != nil {
+		errCleanupfn()
 		return nil, fmt.Errorf("adding scan result headers to local mail copy failed: %w", err)
 	}
 
@@ -398,6 +490,10 @@ func (c *Client) downloadAndScan(msg *imapclt.Message) (*scannedMail, error) {
 }
 
 func (c *Client) ProcessScanBox() error {
+	return c.runIMAPPhase(c.ctx, c.processScanBox)
+}
+
+func (c *Client) processScanBox(ctx context.Context) error {
 	var scannedMails []*scannedMail
 	var malformedMailsUIDs []uint32
 	var errs []error
@@ -406,6 +502,11 @@ func (c *Client) ProcessScanBox() error {
 	logger.Info("processing scan box")
 
 	for msg, err := range c.clt.Messages(c.scanMailbox) {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			c.cleanupScannedMails(scannedMails)
+			return ctxErr
+		}
+
 		if err != nil {
 			if errMalformed, ok := errors.AsType[*imapclt.ErrMalformedMsg](err); ok {
 				logger.Warn(
@@ -418,10 +519,11 @@ func (c *Client) ProcessScanBox() error {
 				continue
 			}
 
+			c.cleanupScannedMails(scannedMails)
 			return fmt.Errorf("fetching messages from scanbox failed: %w", err)
 		}
 
-		sm, err := c.downloadAndScan(msg)
+		sm, err := c.downloadAndScan(ctx, msg)
 		if err != nil {
 			// TODO: abort on local tmpfile errors immediately,
 			// unlikely that the following mail won't encounter the
@@ -433,12 +535,21 @@ func (c *Client) ProcessScanBox() error {
 		scannedMails = append(scannedMails, sm)
 	}
 
-	err := c.replaceWithModifiedMails(scannedMails)
+	if err := ctx.Err(); err != nil {
+		c.cleanupScannedMails(scannedMails)
+		return err
+	}
+
+	err := c.replaceWithModifiedMails(ctx, scannedMails)
 	if err != nil {
 		errs = append(errs, err)
 	}
 
 	if len(malformedMailsUIDs) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		err = c.clt.Move(malformedMailsUIDs, c.inboxMailbox)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("moving malformed mails failed: %w", err))
@@ -453,114 +564,334 @@ func (c *Client) ProcessScanBox() error {
 	return errors.Join(errs...)
 }
 
-// Monitor monitors the Unscanned mailbox for new messages and processes them
-// continuously,
-// It also checks periodically the Ham and Undetected Mailbox for new messages.
-// sents them to rspamd for leanring and moves them to their target inbox.
-//
-// The method blocks until an error occurred or [*Client.Stop] is called.
-// When an error happens [*Client.Stop] should still be called to ensure that
-// the IMAP connection is closed.
+func (c *Client) connectionDone() <-chan struct{} {
+	if client, ok := c.clt.(interface{ Done() <-chan struct{} }); ok {
+		return client.Done()
+	}
+
+	return nil
+}
+
+// Monitor monitors the ScanMailbox for new messages and periodically
+// processes the learning mailboxes. It blocks until an error occurs or Stop is
+// called.
 func (c *Client) Monitor() error {
+	c.runMu.Lock()
+	if c.ctx.Err() != nil {
+		c.runMu.Unlock()
+		return nil
+	}
 	c.wgRun.Add(1)
+	c.runMu.Unlock()
 	defer c.wgRun.Done()
 
-	if err := c.RunOnce(); err != nil {
+	if err := c.runOnce(c.ctx); err != nil {
+		if c.ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 
 	lastLearnAt := time.Now()
 
 	for {
-		eventCh, monitorCancelFn, err := c.clt.Monitor(c.scanMailbox)
+		if c.ctx.Err() != nil {
+			return nil
+		}
+
+		eventCh, stop, err := c.startMonitor(c.ctx)
 		if err != nil {
+			if c.ctx.Err() != nil {
+				return nil
+			}
 			return err
 		}
 
+		learnDelay := max(c.learnInterval-time.Since(lastLearnAt), 0)
+		learnTimer := time.NewTimer(learnDelay)
+		// A quiet IDLE connection has no application-level deadline in
+		// go-imap, so periodically stop and restart it.
+		idleTimer := time.NewTimer(c.idleTimeout)
+
 		c.logger.Debug("waiting for mailbox update events")
-		select {
-		case <-time.After(c.learnInterval - time.Since(lastLearnAt)):
-			c.logger.Debug("periodic timer expired, learning ham, spam and checking the scan mailbox")
-
-			if err := monitorCancelFn(); err != nil {
-				return err
-			}
-
-			// sometimes monitoring stopped working and no updates
-			// were send anymore, despite new imap messages, as
-			// workaround we additionally check the Scanbox. //
-			// TODO: verify if that really is still an issue or
-			// could be removed
-			if err := c.ProcessScanBox(); err != nil {
-				return err
-			}
-
-			if err := c.ProcessHam(); err != nil {
-				return err
-			}
-
-			if err := c.ProcessSpam(); err != nil {
-				return err
-			}
-
-			lastLearnAt = time.Now()
-
-		case evA, ok := <-eventCh:
-			if !ok {
-				c.logger.Debug("event channel was closed")
-				_ = monitorCancelFn()
+		var monitorErr error
+		stopped := false
+		stopMonitor := func() error {
+			if stopped {
 				return nil
 			}
+			stopped = true
+			return c.stopIDLE(stop)
+		}
 
-			if err := monitorCancelFn(); err != nil {
-				return err
-			}
-
-			if evA.NewMsgCount == 0 {
-				c.logger.Debug("ignoring MailboxUpdate, no new messages")
-				continue
-			}
-
-			err = c.ProcessScanBox()
-			if err != nil {
-				return err
-			}
-
-		case <-c.stopCh:
-			if err := monitorCancelFn(); err != nil {
-				return err
-			}
-
+		select {
+		case <-c.ctx.Done():
+			_ = stopMonitor()
 			return nil
+
+		case <-c.connectionDone():
+			_ = stopMonitor()
+			if c.ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("imap connection closed while monitoring: %w", net.ErrClosed)
+
+		case <-idleTimer.C:
+			if err := stopMonitor(); err != nil {
+				if c.ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+			c.logger.Debug("imap idle lease expired, restarting idle monitor")
+
+		case <-learnTimer.C:
+			if err := stopMonitor(); err != nil {
+				if c.ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+
+			c.logger.Debug("periodic timer expired, learning ham, spam and checking the scan mailbox")
+			if err := c.runPeriodicPass(c.ctx); err != nil {
+				if c.ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+			lastLearnAt = time.Now()
+
+		case ev, ok := <-eventCh:
+			if !ok {
+				_ = stopMonitor()
+				if c.ctx.Err() != nil {
+					return nil
+				}
+				return fmt.Errorf("imap monitor event channel closed: %w", net.ErrClosed)
+			}
+
+			if err := stopMonitor(); err != nil {
+				if c.ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+			if ev.NewMsgCount == 0 {
+				c.logger.Debug("ignoring MailboxUpdate, no new messages")
+			} else if err := c.runIMAPPhase(c.ctx, c.processScanBox); err != nil {
+				monitorErr = err
+			}
+		}
+
+		if !learnTimer.Stop() {
+			select {
+			case <-learnTimer.C:
+			default:
+			}
+		}
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+
+		if c.ctx.Err() != nil {
+			return nil
+		}
+		if monitorErr != nil {
+			return monitorErr
 		}
 	}
 }
 
-// RunOnce processes all mails in the ham, spam and scan mailbox once.
-func (c *Client) RunOnce() error {
-	err := c.ProcessHam()
-	if err != nil {
+type monitorStart struct {
+	events <-chan *imapclt.EventNewMessages
+	stop   func() error
+	err    error
+}
+
+func (c *Client) startMonitor(ctx context.Context) (<-chan *imapclt.EventNewMessages, func() error, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	opCtx, cancel := context.WithTimeout(ctx, c.operationTimeout)
+	defer cancel()
+
+	result := make(chan monitorStart, 1)
+	go func() {
+		events, stop, err := c.clt.Monitor(c.scanMailbox)
+		result <- monitorStart{events: events, stop: stop, err: err}
+	}()
+
+	select {
+	case start := <-result:
+		return start.events, start.stop, start.err
+	case <-opCtx.Done():
+		select {
+		case start := <-result:
+			return start.events, start.stop, start.err
+		default:
+		}
+		_ = c.closeTransport()
+		return nil, nil, opCtx.Err()
+	}
+}
+
+func (c *Client) stopIDLE(stop func() error) error {
+	if stop == nil {
+		return nil
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- stop()
+	}()
+
+	timer := time.NewTimer(c.shutdownTimeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-result:
+		return err
+	case <-timer.C:
+		_ = c.closeTransport()
+		resultTimer := time.NewTimer(c.shutdownTimeout)
+		defer resultTimer.Stop()
+		select {
+		case err := <-result:
+			return err
+		case <-resultTimer.C:
+			return context.DeadlineExceeded
+		}
+	}
+}
+
+// closeTransport interrupts go-imap immediately; Close waits for its decoder,
+// so the wait itself is bounded here.
+func (c *Client) closeTransport() error {
+	if c.clt == nil {
+		return nil
+	}
+
+	c.transportCloseOnce.Do(func() {
+		go func() {
+			c.transportCloseErr = c.clt.Close()
+			close(c.transportCloseDone)
+		}()
+	})
+
+	timer := time.NewTimer(c.shutdownTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-c.transportCloseDone:
+		return c.transportCloseErr
+	case <-timer.C:
+		return context.DeadlineExceeded
+	}
+}
+
+// runIMAPPhase bounds a phase that may block in go-imap. go-imap has no
+// context-aware waits, so a timeout must close and discard the connection.
+func (c *Client) runIMAPPhase(ctx context.Context, fn func(context.Context) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	opCtx, cancel := context.WithTimeout(ctx, c.operationTimeout)
+	defer cancel()
+
+	result := make(chan error, 1)
+	go func() {
+		result <- fn(opCtx)
+	}()
+
+	select {
+	case err := <-result:
+		return err
+	case <-opCtx.Done():
+		select {
+		case err := <-result:
+			return err
+		default:
+		}
+		_ = c.closeTransport()
+
+		timer := time.NewTimer(c.shutdownTimeout)
+		defer timer.Stop()
+		select {
+		case err := <-result:
+			if err != nil {
+				return errors.Join(opCtx.Err(), err)
+			}
+			return opCtx.Err()
+		case <-timer.C:
+			return opCtx.Err()
+		}
+	}
+}
+
+func (c *Client) runOnce(ctx context.Context) error {
+	if err := c.runIMAPPhase(ctx, c.processHam); err != nil {
 		return fmt.Errorf("learning ham failed: %w", err)
 	}
 
-	err = c.ProcessSpam()
-	if err != nil {
+	if err := c.runIMAPPhase(ctx, c.processSpam); err != nil {
 		return fmt.Errorf("learning spam failed: %w", err)
 	}
 
-	return c.ProcessScanBox()
+	if err := c.runIMAPPhase(ctx, c.processScanBox); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-// Stop closes the connection the IMAP-Server.
-// If [Client.Monitor] is being executed concurrently, it first terminates it
-// gracefully.
+func (c *Client) runPeriodicPass(ctx context.Context) error {
+	if err := c.runIMAPPhase(ctx, c.processScanBox); err != nil {
+		return err
+	}
+
+	if err := c.runIMAPPhase(ctx, c.processHam); err != nil {
+		return err
+	}
+
+	return c.runIMAPPhase(ctx, c.processSpam)
+}
+
+// RunOnce processes all mails in the ham, spam and scan mailboxes once.
+func (c *Client) RunOnce() error {
+	return c.runOnce(c.ctx)
+}
+
+// Stop cancels processing, interrupts the IMAP transport, and then waits for
+// the monitor goroutine to finish.
 func (c *Client) Stop() error {
 	var err error
 
 	c.stopOnce.Do(func() {
-		close(c.stopCh)
-		c.wgRun.Wait()
-		err = c.clt.Close()
+		c.runMu.Lock()
+		c.cancel()
+		c.runMu.Unlock()
+
+		err = c.closeTransport()
+
+		waitResult := make(chan struct{})
+		go func() {
+			c.wgRun.Wait()
+			close(waitResult)
+		}()
+
+		timer := time.NewTimer(c.shutdownTimeout)
+		defer timer.Stop()
+		select {
+		case <-waitResult:
+		case <-timer.C:
+			err = errors.Join(err, context.DeadlineExceeded)
+		}
 	})
 
 	return err

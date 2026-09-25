@@ -8,23 +8,56 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
+	"time"
 )
 
-type Client struct {
-	checkURL string
-	hamURL   string
-	spamURL  string
-	logger   *slog.Logger
-	password string
+const defaultHTTPTimeout = 2 * time.Minute
+
+// HTTPStatusError reports a non-success response from Rspamd.
+type HTTPStatusError struct {
+	StatusCode int
+	Status     string
 }
 
-func New(logger *slog.Logger, url, password string) *Client {
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("rspamd request failed with status: %s", e.Status)
+}
+
+// Retryable reports whether the status represents a temporary Rspamd failure.
+func (e *HTTPStatusError) Retryable() bool {
+	return e.StatusCode == http.StatusRequestTimeout ||
+		e.StatusCode == http.StatusTooEarly ||
+		e.StatusCode == http.StatusTooManyRequests ||
+		e.StatusCode >= 500
+}
+
+// RetryKey provides a stable retry category for status errors.
+func (e *HTTPStatusError) RetryKey() string {
+	return fmt.Sprintf("http-%d", e.StatusCode)
+}
+
+type Client struct {
+	checkURL   string
+	hamURL     string
+	spamURL    string
+	logger     *slog.Logger
+	password   string
+	httpClient *http.Client
+}
+
+func New(logger *slog.Logger, url, password string, timeouts ...time.Duration) *Client {
+	timeout := defaultHTTPTimeout
+	if len(timeouts) > 0 && timeouts[0] > 0 {
+		timeout = timeouts[0]
+	}
+
 	return &Client{
-		checkURL: url + "/checkv2",
-		hamURL:   url + "/learnham",
-		spamURL:  url + "/learnspam",
-		logger:   logger.WithGroup("rspamc").With("server", url),
-		password: password,
+		checkURL:   url + "/checkv2",
+		hamURL:     url + "/learnham",
+		spamURL:    url + "/learnspam",
+		logger:     logger.WithGroup("rspamc").With("server", url),
+		password:   password,
+		httpClient: &http.Client{Timeout: timeout},
 	}
 }
 
@@ -33,13 +66,13 @@ func (c *Client) logReq(ctx context.Context, req *http.Request) {
 		return
 	}
 
-	reqDump, err := httputil.DumpRequestOut(req, true)
+	reqDump, err := httputil.DumpRequestOut(req, false)
 	if err != nil {
 		c.logger.Warn("converting http request to printable representation failed", "error", err)
 		return
 	}
 
-	c.logger.Debug("sending http-request (password hdr is omitted from msg)", "request", string(reqDump))
+	c.logger.Debug("sending http-request (body and password are omitted)", "request", string(reqDump))
 }
 
 func (c *Client) logResp(ctx context.Context, resp *http.Response) {
@@ -47,7 +80,7 @@ func (c *Client) logResp(ctx context.Context, resp *http.Response) {
 		return
 	}
 
-	respDump, err := httputil.DumpResponse(resp, true)
+	respDump, err := httputil.DumpResponse(resp, false)
 	if err != nil {
 		c.logger.Warn(
 			"converting http response to printable representation failed",
@@ -56,23 +89,27 @@ func (c *Client) logResp(ctx context.Context, resp *http.Response) {
 		return
 	}
 
-	c.logger.Debug("received http-response", "response", string(respDump))
+	c.logger.Debug("received http-response (body omitted)", "response", string(respDump))
 }
 
 func (c *Client) sendRequest(ctx context.Context, url string, msg io.Reader, result any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, msg)
 	if err != nil {
-		return nil
+		return fmt.Errorf("creating rspamd request failed: %w", err)
 	}
 
 	c.logReq(ctx, req)
 
 	req.Header.Add("password", c.password)
 
-	// TODO: use custom client with configured timeouts
-	resp, err := http.DefaultClient.Do(req)
+	httpClient := c.httpClient
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil
+		return fmt.Errorf("sending rspamd request failed: %w", err)
 	}
 
 	defer func() {
@@ -82,12 +119,16 @@ func (c *Client) sendRequest(ctx context.Context, url string, msg io.Reader, res
 
 	c.logResp(ctx, resp)
 
-	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode >= 200 && resp.StatusCode <= 300 {
+	if result == nil {
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return nil
 		}
 
-		return fmt.Errorf("request failed with status: %s", resp.Status)
+		return &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 
 	const contentTypeJSON = "application/json"
@@ -96,11 +137,8 @@ func (c *Client) sendRequest(ctx context.Context, url string, msg io.Reader, res
 		return fmt.Errorf("got response with content-type: %q, expecting: %q", ctype, contentTypeJSON)
 	}
 
-	c.logResp(ctx, resp)
-
-	err = json.NewDecoder(resp.Body).Decode(result)
-	if err != nil {
-		return err
+	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
+		return fmt.Errorf("decoding rspamd response failed: %w", err)
 	}
 
 	return nil

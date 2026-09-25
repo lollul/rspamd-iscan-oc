@@ -1,6 +1,8 @@
 package imapclt
 
 import (
+	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +30,8 @@ type Client struct {
 	allowInsecure bool
 
 	clt         *imapclient.Client
+	rawConn     net.Conn
+	connMu      sync.Mutex
 	logger      *slog.Logger
 	logIMAPData bool
 
@@ -68,14 +72,23 @@ func NewClient(cfg *Config) *Client {
 	}
 }
 
-// Connect establishes a connection the IMAP-Server.
+// Connect establishes a connection to the IMAP server.
 func (c *Client) Connect() error {
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	return c.ConnectContext(ctx)
+}
+
+// ConnectContext establishes a connection to the IMAP server and interrupts
+// an in-progress dial, TLS handshake, or login when ctx is canceled.
+func (c *Client) ConnectContext(ctx context.Context) error {
 	var debugWriter io.Writer
 	if c.logIMAPData {
 		debugWriter = NewDebugWriter(c.logger)
 	}
 
-	clt, err := c.dial(c.address, c.allowInsecure, &imapclient.Options{
+	clt, err := c.dialContext(ctx, c.address, c.allowInsecure, &imapclient.Options{
 		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
 			Mailbox: c.mailboxUpdateHandler,
 		},
@@ -85,10 +98,25 @@ func (c *Client) Connect() error {
 	if err != nil {
 		return fmt.Errorf("establishing imap server connection failed: %w", err)
 	}
-	c.clt = clt
 
-	if err := clt.Login(c.user, c.password).Wait(); err != nil {
-		return fmt.Errorf("login at imap server failed: %w", err)
+	c.connMu.Lock()
+	c.clt = clt
+	c.connMu.Unlock()
+
+	loginResult := make(chan error, 1)
+	go func() {
+		loginResult <- clt.Login(c.user, c.password).Wait()
+	}()
+
+	select {
+	case err := <-loginResult:
+		if err != nil {
+			_ = c.Close()
+			return fmt.Errorf("login at imap server failed: %w", err)
+		}
+	case <-ctx.Done():
+		_ = c.Close()
+		return fmt.Errorf("login at imap server canceled: %w", ctx.Err())
 	}
 
 	c.logger.Info("connection established, authentication succeeded",
@@ -98,30 +126,123 @@ func (c *Client) Connect() error {
 }
 
 func (c *Client) Close() error {
-	return c.clt.Close()
+	c.connMu.Lock()
+	clt := c.clt
+	rawConn := c.rawConn
+	c.connMu.Unlock()
+
+	if clt != nil {
+		return clt.Close()
+	}
+	if rawConn != nil {
+		return rawConn.Close()
+	}
+
+	return nil
 }
 
-func (c *Client) dial(address string, allowInsecure bool, opts *imapclient.Options) (*imapclient.Client, error) {
-	_, port, err := net.SplitHostPort(address)
+// Done is closed when the underlying IMAP connection is closed.
+func (c *Client) Done() <-chan struct{} {
+	c.connMu.Lock()
+	clt := c.clt
+	c.connMu.Unlock()
+	if clt == nil {
+		return nil
+	}
+
+	return clt.Closed()
+}
+
+func (c *Client) dialContext(ctx context.Context, address string, allowInsecure bool, opts *imapclient.Options) (*imapclient.Client, error) {
+	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, err
 	}
 
 	logger := c.logger.With("server", address).With("timeout", dialTimeout)
+	rawConn, err := c.dialRawContext(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+
+	c.connMu.Lock()
+	c.rawConn = rawConn
+	c.connMu.Unlock()
 
 	if port == "993" || port == "imaps" {
 		logger.Debug("connecting to imap server", "tlsmode", "implicit")
-		return imapclient.DialTLS(address, opts)
+		tlsConfig := cloneTLSConfig(opts.TLSConfig)
+		if tlsConfig.ServerName == "" {
+			tlsConfig.ServerName = host
+		}
+		if tlsConfig.NextProtos == nil {
+			tlsConfig.NextProtos = []string{"imap"}
+		}
+
+		tlsConn := tls.Client(rawConn, tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = rawConn.Close()
+			return nil, err
+		}
+
+		return imapclient.New(tlsConn, opts), nil
 	}
 
 	logger.Debug("connecting to imap server", "tlsmode", "explicit")
-	clt, err := imapclient.DialStartTLS(address, opts)
-	if err != nil && allowInsecure && isStartTLSNotSupportedErr(err) {
-		logger.Warn("establishing secure connection failed, connecting without encryption", "tlsmode", "none", "error", err)
-		return imapclient.DialInsecure(address, opts)
+	tlsConfig := cloneTLSConfig(opts.TLSConfig)
+	if tlsConfig.ServerName == "" {
+		tlsConfig.ServerName = host
+	}
+	startTLSOptions := *opts
+	startTLSOptions.TLSConfig = tlsConfig
+
+	type startTLSResult struct {
+		client *imapclient.Client
+		err    error
+	}
+	startResult := make(chan startTLSResult, 1)
+	go func() {
+		client, err := imapclient.NewStartTLS(rawConn, &startTLSOptions)
+		startResult <- startTLSResult{client: client, err: err}
+	}()
+
+	select {
+	case result := <-startResult:
+		if result.err != nil && allowInsecure && isStartTLSNotSupportedErr(result.err) {
+			logger.Warn("establishing secure connection failed, connecting without encryption", "tlsmode", "none", "error", result.err)
+			return c.dialInsecureContext(ctx, address, opts)
+		}
+		return result.client, result.err
+	case <-ctx.Done():
+		_ = rawConn.Close()
+		return nil, ctx.Err()
+	}
+}
+
+func (c *Client) dialRawContext(ctx context.Context, address string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: dialTimeout}
+	return dialer.DialContext(ctx, "tcp", address)
+}
+
+func (c *Client) dialInsecureContext(ctx context.Context, address string, opts *imapclient.Options) (*imapclient.Client, error) {
+	rawConn, err := c.dialRawContext(ctx, address)
+	if err != nil {
+		return nil, err
 	}
 
-	return clt, err
+	c.connMu.Lock()
+	c.rawConn = rawConn
+	c.connMu.Unlock()
+
+	return imapclient.New(rawConn, opts), nil
+}
+
+func cloneTLSConfig(config *tls.Config) *tls.Config {
+	if config == nil {
+		return &tls.Config{}
+	}
+
+	return config.Clone()
 }
 
 func isStartTLSNotSupportedErr(err error) bool {

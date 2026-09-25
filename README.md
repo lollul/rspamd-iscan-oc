@@ -95,12 +95,21 @@ SpamThreshold           = 10.0
 # Minimal severity of log messages to be printed,
 # supported levels: debug, info, warn, error
 LogLevel                = "info"
+# Timeouts in seconds. IMAPOperationTimeout bounds a mailbox processing phase;
+# IMAPIdleTimeoutSeconds is a maximum quiet IDLE period before the connection is
+# gracefully restarted (or forcibly closed if needed).
+RspamdTimeoutSeconds        = 120
+IMAPOperationTimeoutSeconds = 300
+IMAPIdleTimeoutSeconds      = 600
+ShutdownTimeoutSeconds      = 10
 # Raw incoming and outgoing IMAP data is logged with debug log level.
 # The logged data can contain sensitive information, like credentials.
 LogIMAPData             = false
 # Mark mails in UndetectedMailbox as read when moving them to SpamMailbox.
 MarkLearnedAsSpamAsRead = true
 ```
+
+`RspamdTimeoutSeconds` applies to each HTTP scan or learning request. `IMAPOperationTimeoutSeconds` bounds connection setup, login, and each mailbox-processing phase; when it expires, the IMAP connection is closed and the operation is retried with a fresh connection. `IMAPIdleTimeoutSeconds` bounds a quiet IDLE cycle. `ShutdownTimeoutSeconds` bounds graceful IDLE shutdown and worker cleanup before a forced close.
 
 ### Credentials Directory
 
