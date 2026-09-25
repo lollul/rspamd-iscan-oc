@@ -245,10 +245,28 @@ func (c *Client) Monitor(mailbox string) (
 
 	return ch, func() error {
 		logger.Debug("stopping idle command")
-		err := errors.Join(idlecmd.Close(), idlecmd.Wait())
-		c.setNewMessagesCH(nil)
-		close(ch)
-		return err
+
+		// Use a timeout to prevent blocking forever on dead connections
+		type idleResult struct {
+			err error
+		}
+		resultCh := make(chan idleResult, 1)
+		go func() {
+			err := errors.Join(idlecmd.Close(), idlecmd.Wait())
+			resultCh <- idleResult{err: err}
+		}()
+
+		select {
+		case res := <-resultCh:
+			c.setNewMessagesCH(nil)
+			close(ch)
+			return res.err
+		case <-time.After(10 * time.Second):
+			logger.Warn("timeout stopping idle command, forcing close")
+			c.setNewMessagesCH(nil)
+			close(ch)
+			return errors.New("timeout stopping idle command")
+		}
 	}, nil
 }
 
