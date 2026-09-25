@@ -6,16 +6,19 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
+	"time"
 )
 
 type Client struct {
-	checkURL string
-	hamURL   string
-	spamURL  string
-	logger   *slog.Logger
-	password string
+	checkURL  string
+	hamURL    string
+	spamURL   string
+	logger    *slog.Logger
+	password  string
+	httpClient *http.Client
 }
 
 func New(logger *slog.Logger, url, password string) *Client {
@@ -25,6 +28,19 @@ func New(logger *slog.Logger, url, password string) *Client {
 		spamURL:  url + "/learnspam",
 		logger:   logger.WithGroup("rspamc").With("server", url),
 		password: password,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
+		},
 	}
 }
 
@@ -62,17 +78,16 @@ func (c *Client) logResp(ctx context.Context, resp *http.Response) {
 func (c *Client) sendRequest(ctx context.Context, url string, msg io.Reader, result any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, msg)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	c.logReq(ctx, req)
 
 	req.Header.Add("password", c.password)
 
-	// TODO: use custom client with configured timeouts
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	defer func() {
