@@ -19,6 +19,9 @@ import (
 const (
 	defChanBufSiz = 1
 	dialTimeout   = 120 * time.Second
+	// idleTimeout is the maximum time to wait in IDLE before sending a NOOP
+	// to check connection health. RFC 2177 recommends at least 10 minutes.
+	idleTimeout = 10 * time.Minute
 )
 
 type Client struct {
@@ -206,7 +209,7 @@ func (c *Client) Upload(path, mailbox string, ts time.Time) error {
 
 // Monitor starts to monitor mailbox for new messages.
 // When new messages are found an event is sent to ch.
-// Message delivery to ch must not block. If delievery would block the
+// Message delivery to ch must not block. If delivery would block the
 // message is discarded.
 //
 // While Monitor is running, running other IMAP operations will block forever!
@@ -236,36 +239,101 @@ func (c *Client) Monitor(mailbox string) (
 
 	c.setNewMessagesCH(ch)
 
-	idlecmd, err := c.clt.Idle()
-	if err != nil {
-		c.setNewMessagesCH(nil)
-		close(ch)
-		return nil, nil, err
-	}
+	// Channel to signal the idle loop to stop
+	stopCh := make(chan struct{})
+	// Channel to return the final error from the idle loop
+	errCh := make(chan error, 1)
 
-	return ch, func() error {
-		logger.Debug("stopping idle command")
+	// Start the idle loop in a goroutine
+	go func() {
+		var idleCmd *imapclient.IdleCommand
+		var lastErr error
 
-		// Use a timeout to prevent blocking forever on dead connections
-		type idleResult struct {
-			err error
+		for {
+			select {
+			case <-stopCh:
+				// Stop requested, close idle command if running
+				if idleCmd != nil {
+					_ = idleCmd.Close()
+				}
+				errCh <- lastErr
+				return
+			default:
+			}
+
+			// Start IDLE command
+			idleCmd, err = c.clt.Idle()
+			if err != nil {
+				lastErr = fmt.Errorf("starting IDLE failed: %w", err)
+				errCh <- lastErr
+				return
+			}
+
+			logger.Debug("IDLE command started")
+
+			// Wait for IDLE to complete in a goroutine
+			idleDone := make(chan error, 1)
+			go func() {
+				idleDone <- idleCmd.Wait()
+			}()
+
+			select {
+			case <-stopCh:
+				// Stop requested during IDLE - close will make Wait() return
+				_ = idleCmd.Close()
+				// Wait for the goroutine to finish
+				_ = <-idleDone
+				errCh <- lastErr
+				return
+			case err := <-idleDone:
+				// IDLE completed (server sent update or error)
+				if err != nil {
+					lastErr = fmt.Errorf("IDLE wait failed: %w", err)
+					logger.Debug("IDLE command returned error", "error", err)
+					errCh <- lastErr
+					return
+				}
+				// IDLE completed successfully (server sent update)
+				// The unilateral data handler will have sent the event
+				// Continue loop to re-enter IDLE
+				logger.Debug("IDLE command completed, re-entering")
+				continue
+			case <-time.After(idleTimeout):
+				// Timeout reached, send NOOP to check connection health
+				logger.Debug("IDLE timeout reached, sending NOOP to check connection")
+				_ = idleCmd.Close()
+				// Wait for the goroutine to finish (Wait() returns after Close())
+				_ = <-idleDone
+
+				// Send NOOP to verify connection is still alive
+				noopCmd := c.clt.Noop()
+				if err := noopCmd.Wait(); err != nil {
+					lastErr = fmt.Errorf("NOOP wait failed: %w", err)
+					errCh <- lastErr
+					return
+				}
+				logger.Debug("NOOP successful, re-entering IDLE")
+				// Continue loop to re-enter IDLE
+				continue
+			}
 		}
-		resultCh := make(chan idleResult, 1)
-		go func() {
-			err := errors.Join(idlecmd.Close(), idlecmd.Wait())
-			resultCh <- idleResult{err: err}
-		}()
+	}()
 
+	// Return the stop function that signals the idle loop to stop
+	return ch, func() error {
+		logger.Debug("stopping idle monitor")
+		close(stopCh)
+		// Wait for the idle loop to finish with a timeout
 		select {
-		case res := <-resultCh:
+		case err := <-errCh:
 			c.setNewMessagesCH(nil)
 			close(ch)
-			return res.err
+			return err
 		case <-time.After(10 * time.Second):
-			logger.Warn("timeout stopping idle command, forcing close")
+			logger.Warn("timeout stopping idle monitor, forcing close")
 			c.setNewMessagesCH(nil)
 			close(ch)
-			return errors.New("timeout stopping idle command")
+			return errors.New("timeout stopping idle monitor")
 		}
 	}, nil
 }
