@@ -26,6 +26,7 @@ type Client struct {
 	user          string
 	password      string
 	allowInsecure bool
+	keepAlive     time.Duration
 
 	clt         *imapclient.Client
 	logger      *slog.Logger
@@ -49,6 +50,9 @@ type Config struct {
 	// LogIMAPData enables logging raw IMAP protocol data with debug
 	// priority, it can contain sensitive information
 	LogIMAPData bool
+	// KeepAlive enables TCP keepalive on the IMAP connection.
+	// If zero, keepalive is disabled. Default is 30 seconds.
+	KeepAlive time.Duration
 }
 
 type EventNewMessages struct {
@@ -58,11 +62,16 @@ type EventNewMessages struct {
 // NewClient creates an new IMAP-Client.
 // [*Client.Connect] must be called before any other methods.
 func NewClient(cfg *Config) *Client {
+	keepAlive := cfg.KeepAlive
+	if keepAlive == 0 {
+		keepAlive = 30 * time.Second
+	}
 	return &Client{
 		address:       cfg.Address,
 		user:          cfg.User,
 		password:      cfg.Password,
 		allowInsecure: cfg.AllowInsecure,
+		keepAlive:     keepAlive,
 		logger:        log.EnsureLoggerInstance(cfg.Logger),
 		logIMAPData:   cfg.LogIMAPData,
 	}
@@ -79,7 +88,7 @@ func (c *Client) Connect() error {
 		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
 			Mailbox: c.mailboxUpdateHandler,
 		},
-		Dialer:      &net.Dialer{Timeout: dialTimeout},
+		Dialer:      &net.Dialer{Timeout: dialTimeout, KeepAlive: c.keepAlive},
 		DebugWriter: debugWriter,
 	})
 	if err != nil {

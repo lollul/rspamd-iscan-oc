@@ -114,6 +114,7 @@ func newIMAPClient(cfg *config.Config, flags *flags, logger *slog.Logger) (iscan
 		AllowInsecure: false,
 		Logger:        logger,
 		LogIMAPData:   cfg.LogIMAPData,
+		KeepAlive:     30 * time.Second,
 	}
 
 	if flags.dryRun {
